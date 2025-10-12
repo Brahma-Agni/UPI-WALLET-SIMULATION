@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, redirect, session, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate # New: For managing database schema changes
 from werkzeug.security import generate_password_hash, check_password_hash
 import qrcode, os
 from datetime import datetime
@@ -7,18 +8,24 @@ from datetime import datetime
 # Initialize Flask App
 app = Flask(__name__)
 
-# Configuration
-# Use environment variable for secret key in production, fallback for local dev
+# --- Configuration ---
+# 1. Secret Key: Must be set in the cloud (Vercel/Render) environment variables.
 app.secret_key = os.environ.get('SECRET_KEY', 'your_super_secret_key_change_me_in_prod')
 
-# Database Configuration (SQLite for local, PostgreSQL for Render deployment)
-# Render automatically provides DATABASE_URL for PostgreSQL
-# For local development, it will use db.sqlite3
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///db.sqlite3')
+# 2. Database URI: Uses the remote DATABASE_URL (PostgreSQL from Neon) in production,
+#    and falls back to SQLite for local development.
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
+    'DATABASE_URL', 
+    'sqlite:///db.sqlite3'
+).replace("postgres://", "postgresql://", 1) # Vercel sometimes uses 'postgres://', SQLAlchemy requires 'postgresql://'
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
+
+# Initialize Flask-Migrate
+migrate = Migrate(app, db)
 
 
 # -------------------- MODELS --------------------
@@ -50,7 +57,7 @@ class Transaction(db.Model):
     sender_upi = db.Column(db.String(100), nullable=False)
     receiver_upi = db.Column(db.String(100), nullable=False)
     amount = db.Column(db.Float, nullable=False)
-    description = db.Column(db.String(255), nullable=True)  # Added description field
+    description = db.Column(db.String(255), nullable=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
     def __repr__(self):
@@ -60,19 +67,27 @@ class Transaction(db.Model):
 # -------------------- QR GENERATION --------------------
 def generate_qr(upi_id):
     """Generates a QR code for the given UPI ID and saves it to static/qrcodes/."""
-    upi_url = f"upi://pay?pa={upi_id}&pn=WalletUser&cu=INR"  # Added currency code
+    upi_url = f"upi://pay?pa={upi_id}&pn=WalletUser&cu=INR"
     qr_dir = os.path.join(app.root_path, 'static', 'qrcodes')
-    os.makedirs(qr_dir, exist_ok=True)  # Ensure the directory exists
+    
+    # NOTE: In Vercel/Render, the 'static' folder is READ-ONLY in the deployed function.
+    # This code will only run successfully during the initial build phase, or locally.
+    # If the file does not exist, the app will need to handle a missing QR image URL.
+    os.makedirs(qr_dir, exist_ok=True)
 
     qr_filename = f'{upi_id}.png'
     path = os.path.join(qr_dir, qr_filename)
 
-    # Only generate if the file doesn't exist to avoid redundant operations
     if not os.path.exists(path):
-        img = qrcode.make(upi_url)
-        img.save(path)
+        try:
+            img = qrcode.make(upi_url)
+            img.save(path)
+        except Exception as e:
+            # Important for deployment: If file creation fails (due to read-only FS), 
+            # log the error and return a placeholder path.
+            print(f"QR Code generation failed for {upi_id}: {e}")
+            return 'qrcodes/placeholder.png' # You might want a default placeholder image
 
-    # Return the path relative to the static folder for url_for
     return f'qrcodes/{qr_filename}'
 
 
@@ -87,7 +102,7 @@ def index():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     """Handles user registration."""
-    if 'user_id' in session:  # If already logged in, redirect to dashboard
+    if 'user_id' in session:
         return redirect(url_for('dashboard'))
 
     if request.method == 'POST':
@@ -99,18 +114,12 @@ def register():
             flash('All fields are required.', 'error')
             return redirect(url_for('register'))
 
-        if '@' not in email:
-            flash('Please enter a valid email address.', 'error')
-            return redirect(url_for('register'))
-
-        # Check if email already registered
         if User.query.filter_by(email=email).first():
             flash('Email already registered. Please use a different email or log in.', 'error')
             return redirect(url_for('register'))
 
-        # Generate UPI ID
+        # Generate UPI ID logic
         upi_id_base = email.split('@')[0]
-        # Basic check for uniqueness, could be more robust
         unique_upi_id = f"{upi_id_base}@mockupi"
         counter = 1
         while User.query.filter_by(upi_id=unique_upi_id).first():
@@ -122,13 +131,15 @@ def register():
         # Create user and wallet
         user = User(name=name, email=email, password=hashed_password, upi_id=unique_upi_id)
         db.session.add(user)
-        db.session.commit()  # Commit user first to get user.id
+        db.session.commit()
 
-        wallet = Wallet(user_id=user.id, balance=1000.0)  # Initial balance
+        wallet = Wallet(user_id=user.id, balance=1000.0)
         db.session.add(wallet)
         db.session.commit()
 
         # Generate QR code for the new user
+        # NOTE: This only works locally or during Vercel build phase. 
+        # For production, you might need an S3 bucket or similar service for user-generated content.
         generate_qr(unique_upi_id)
 
         flash('Registration successful! Please log in.', 'success')
@@ -140,7 +151,7 @@ def register():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     """Handles user login."""
-    if 'user_id' in session:  # If already logged in, redirect to dashboard
+    if 'user_id' in session:
         return redirect(url_for('dashboard'))
 
     if request.method == 'POST':
@@ -167,18 +178,17 @@ def dashboard():
         return redirect(url_for('login'))
 
     user = User.query.get(session['user_id'])
-    if not user:  # Should not happen if session['user_id'] is valid
+    if not user:
         session.clear()
         flash('User not found. Please log in again.', 'error')
         return redirect(url_for('login'))
 
     wallet = Wallet.query.filter_by(user_id=user.id).first()
-    if not wallet:  # Should not happen if registration works correctly
+    if not wallet:
         flash('Wallet not found for your account. Please contact support.', 'error')
-        # Potentially create a wallet here or log an error
         return redirect(url_for('logout'))
 
-    qr_static_path = generate_qr(user.upi_id)  # Generate QR code if it doesn't exist
+    qr_static_path = generate_qr(user.upi_id)
 
     return render_template('dashboard.html', user=user, wallet=wallet, qr_path=qr_static_path)
 
@@ -223,7 +233,6 @@ def transfer():
 
     receiver_wallet = Wallet.query.filter_by(user_id=receiver_user.id).first()
     if not receiver_wallet:
-        # This case should ideally not happen if every user has a wallet
         flash('Recipient wallet not found. Please contact support.', 'error')
         return redirect(url_for('dashboard'))
 
@@ -247,7 +256,7 @@ def transfer():
         db.session.commit()
         flash(f'Successfully sent ₹{amount:.2f} to {receiver_upi}.', 'success')
     except Exception as e:
-        db.session.rollback()  # Rollback changes if anything goes wrong
+        db.session.rollback()
         flash(f'An error occurred during transfer: {e}', 'error')
 
     return redirect(url_for('dashboard'))
@@ -270,7 +279,7 @@ def history():
     transactions = Transaction.query.filter(
         (Transaction.sender_upi == user.upi_id) |
         (Transaction.receiver_upi == user.upi_id)
-    ).order_by(Transaction.timestamp.desc()).all()  # Order by newest first
+    ).order_by(Transaction.timestamp.desc()).all()
 
     return render_template('history.html', transactions=transactions, user=user)
 
@@ -278,16 +287,12 @@ def history():
 @app.route('/logout')
 def logout():
     """Logs the user out."""
-    session.clear()  # Clears all session data
+    session.clear()
     flash('You have been successfully logged out.', 'success')
     return redirect(url_for('index'))
 
 
-# -------------------- DATABASE INITIALIZATION --------------------
-# This block ensures tables are created when the app runs locally
-# For production deployment on Render with PostgreSQL, you'd typically
-# run `db.create_all()` once via a Render build command or shell.
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True)  # debug=True for local development
+# --- Deployment Readiness ---
+# IMPORTANT: Removed the 'if __name__ == "__main__":' block.
+# Vercel/Render will automatically discover the 'app' variable and run it.
+# Local execution now requires running 'flask run' in the terminal.
