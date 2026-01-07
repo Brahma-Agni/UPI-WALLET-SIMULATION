@@ -1,5 +1,8 @@
 Flask==2.3.2
 Flask-SQLAlchemy==3.0.3
+Flask-Migrate==4.0.4
 Werkzeug==2.3.7
+psycopg2-binary==2.9.7
 qrcode==7.4.2
-gunicorn==20.1.0 # For deployment on platforms like Render
+Pillow==10.0.0
+gunicorn==20.1.0
